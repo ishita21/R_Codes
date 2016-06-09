@@ -1,0 +1,483 @@
+################ NEW ##############
+
+### R code for automation of ad_partner summary of all adspots #####
+### R code for automation of RTB_ecpm_threshold, Agency_ecpc_threshold & Ad-network weightage change alarm AND new RTB_ecpm and Agency_ecpc Threshold #####
+### Ishita ###
+#########################################
+rm(list = ls())
+ls()
+##############
+program.start.time <- Sys.time()
+paste0("Start Time of the code: ",program.start.time)
+########
+### Required R-Packages ###
+print("R-pkgs load: 'RODBC','functional','IDPmisc',reshape','lubridate','stringr','plyr','dplyr','xlsx'")
+required_pkg <- c("RODBC","functional","IDPmisc","reshape","lubridate","stringr","plyr","dplyr","xlsx")
+for(i in required_pkg) {if(i %in% rownames(installed.packages()) == FALSE) {install.packages(i, repos ='http://cran.us.r-project.org')}}
+library(RODBC)              # RODBC for connection with mysql from R
+library(functional)         # functional for use of Reduce function to merge multiple dataframe
+library(IDPmisc)            # to use function NaRV.omit (omit Not a Regular Value)
+library(reshape)            # to use cast and melt function
+library(lubridate)          # use of month(), day() functions
+library(stringr)            # use of str_extract function
+library(plyr)               # use of ddply, arrange
+library(dplyr)
+library(xlsx)               # to write dataframes in multiple sheets of a single excel file
+#####################################
+## Parameters ##
+print("### Parameters define ###")
+inputdata_path = "/data/ishita.m/crontab_job/"
+setwd(inputdata_path)   # set current location
+
+currentDate <- Sys.Date()
+end_date <- Sys.Date() - 1
+DATE_INTERVAL <- 6  # last 7 day 
+start_date <- end_date - DATE_INTERVAL
+date_diff <- as.numeric(as.data.frame(end_date-start_date)) + 1   #no. of days of data to be considered
+
+start_month <-month(start_date, label = TRUE) ; start_day <- day(start_date)
+end_month <-month(end_date, label = TRUE) ; end_day <- day(end_date)
+
+###############################################################
+NO_NETWORK <- 0
+AGENCY_ID <- 1              # adpartner_id of Agency
+RTB_ID <- 2                 # adpartner_id of RTB
+REMNANT <- 3
+PROMOTION <- 4
+DIRECT_DEAL <- 5
+ADN_ID <- 6
+ag_rtb_dd_rem <- c(AGENCY_ID, RTB_ID, REMNANT, DIRECT_DEAL)
+EXCLUDE_NETWORK_LIST <- c(NO_NETWORK,REMNANT,PROMOTION,DIRECT_DEAL)
+
+RTB_TH_DEV <- 0.2
+AGENCY_TH_DEV <- 0.2
+DEFAULT_ECPC <- 0.01                # set default ecpc where click is zero
+WT_DEV_ALLWNC <- 0.25  # maximum allowance %age of ad-network weight deviance
+###############################
+### COPY FROM vmax_partner_stats ### 
+last_2_days <- c(today_date <- noquote(as.character(currentDate)), noquote(as.character(currentDate - 1)))
+#################################
+## get list of files of vmax_partner_stats
+partner_stats_list <- read.table(text = system("aws s3 ls s3://vs-datascience/team/ashish/projects/vmax_partner_stats/ | grep '.csv.gz$'",intern=TRUE))
+partner_stats_list <- partner_stats_list[partner_stats_list[, 1] %in% last_2_days, ] #subset for current date data file details
+colnames(partner_stats_list) <- c("modif_date","time","size","file_name")
+## get date from file_name and add a new column
+partner_stats_list$date_concat <- str_extract(partner_stats_list$file_name, "[[:digit:]]+")
+#################################
+# list of mediation_data folder list date wise 
+mediation_data_list <- read.table(text = system("aws s3 ls s3://vs-datascience/team/ashish/projects/vmax_analysis/mediaton_data/",intern=TRUE))
+mediation_data_list$date <- noquote(as.character(gsub("/", "", mediation_data_list[,2])))
+#concat date and ad a new column
+mediation_data_list$date_concat <- gsub("-", "", mediation_data_list$date)
+mediation_data_list <- mediation_data_list[ ,c("date","date_concat")]
+colnames(mediation_data_list)[which(names(mediation_data_list) == "date")] <- "mediation_date"
+#################################
+
+### merge two dataframes to get the list of files to copy
+to_delete_intersect <- merge(partner_stats_list[, c("file_name", "date_concat")], mediation_data_list, by.x = "date_concat", by.y ="date_concat", all.x=T)
+to_delete_intersect$mediation_date[length(to_delete_intersect$mediation_date)] <- noquote(as.character(currentDate - 1))
+#################################
+
+####### DELETE LAST TWO DAYS FOLDERS FROM MEDIATION_DATA ####
+for ( i in 1:nrow(to_delete_intersect)) {
+  path <- paste0("aws s3 rm s3://vs-datascience/team/ashish/projects/vmax_analysis/mediaton_data/",to_delete_intersect$mediation_date[i],"/"," --recursive")
+  print(path)
+  system(paste0(path),intern = FALSE, ignore.stdout = FALSE, ignore.stderr = FALSE, wait = TRUE, input = NULL)
+}
+#################################
+
+### COPY from VMAX_PARTNERS to VMAX_MEDIATION ###
+for(i in 1:nrow(to_delete_intersect)) {
+  from_to <- paste0("aws s3 cp s3://vs-datascience/team/ashish/projects/vmax_partner_stats/",to_delete_intersect$file_name[i]," ","s3://vs-datascience/team/ashish/projects/vmax_analysis/mediaton_data/",to_delete_intersect$mediation_date[i],"/")
+  system(paste0(from_to), intern = FALSE, ignore.stdout = FALSE, ignore.stderr = FALSE, wait = TRUE, input = NULL)
+  print(from_to)
+}
+#################################
+
+##### DELETE LOCAL MEDIATION FOLDER : MEDIATION_DATA_DATEWISE if any exists from previous code run #####
+print("-- Delete of any previous mediation data saved in current path --")
+system("rm -rf mediation_data_datewise", intern = FALSE, ignore.stdout = FALSE, ignore.stderr = FALSE, wait = TRUE, input = NULL)
+
+#################################
+### mediation data copy from S3 to LOCAL" ###
+print("-- copy mediation data from s3 to DS --")
+system("aws s3 cp s3://vs-datascience/team/ashish/projects/vmax_analysis/mediaton_data/ /data/ishita.m/crontab_job/mediation_data_datewise/ --recursive", intern = FALSE, ignore.stdout = FALSE, ignore.stderr = FALSE, wait = TRUE, input = NULL)
+###################################################
+######### SQL PART #############
+### metavalue mapping table creation from mysql ###
+print("-- Connecting Master DB --")
+channel <- odbcConnect("datascience-mysql", uid="datascience", pwd="datascience@123", believeNRows=FALSE)   # connect mysql
+print("get table_names of the available tables")
+tables <- sqlQuery(channel, 'show tables')
+
+print("get zoneid, affiliateid, zonename, zonekey from the table 'ox_zones'")
+zone_dat <- sqlQuery(channel, 'select affiliateid, zoneid, zonename, zonekey, zone_type, delivery, app_bb_type, incent_type from ox_zones')                # create dataframe from ox_zones table
+zone_dat <- zone_dat[zone_dat$delivery %in% c(0,8,16), ]
+#  Replace NA values of the incent_type by zero. e.g.   dat$four[is.na(dat$four)] <- 0
+zone_dat$incent_type[is.na(zone_dat$incent_type)] <- 0
+# add label of zone_id's
+zone_dat$zone_label <- ifelse(zone_dat$zone_type == "app_channel", "app_channel", 
+                              ifelse(zone_dat$zone_type == "video", "video", 
+                                     ifelse(zone_dat$zone_type == "site", ifelse(zone_dat$delivery == 0, ifelse(zone_dat$app_bb_type == 2, "site_native_infeed", "site_banner"), ifelse(zone_dat$app_bb_type == 2, "site_native_content_stream", "site_interstitial")), 
+                                            ifelse(zone_dat$delivery == 0, ifelse(zone_dat$app_bb_type == 2, "app_native_infeed", "app_banner"), 
+                                                   ifelse(zone_dat$app_bb_type == 4, "interstitial_video", 
+                                                          ifelse(zone_dat$app_bb_type == 3, "app_interstitial", 
+                                                                 ifelse(zone_dat$app_bb_type == 2, "app_native_content_stream", ifelse(zone_dat$incent_type == 2, "rewarded_video", "offerwall"))))))))
+
+zone_dat <- zone_dat[ , c("affiliateid","zone_type","zoneid","zonename","zonekey","zone_label")]
+
+print("get affiliateid, name, mp_account_id from the table 'ox_affiliates'")
+affiliate_dat <- sqlQuery(channel, 'select affiliateid, name, mp_account_id from ox_affiliates')            # create dataframe from ox_affiliates table
+colnames(affiliate_dat) <- c("affiliateid", "ac_name", "ac_id")
+
+print("get distinct zone, adnetwork_metavalue, master_id, adnetwork_pref, adnetwork_id from the table 'ox_vserv_data_vmax_adsourceid_mapping'")
+metavalue_dat <- sqlQuery(channel, 'select distinct zone, adnetwork_metavalue, master_id, adnetwork_pref, adnetwork_id from ox_vserv_data_vmax_adsourceid_mapping where adnetwork_id in (1,2,3,4,5,45,46,95,120,145,165,189,1785,1939,1971,2523,4052,5496,6221,6222,6223,6224,6225,6226,6227,6334,11565,28409,28410,41995,42846,42848,42850,45640,46284,46286,47604,47651,48142,52096,53492,53493,53494,54212,54213,54214,54563,55126,55127,55128,57200,57201,57370,57371,58729,58911,58912,59941,59942,59943,60378,60466,60703,60704,60705,60947,60948,60952,61119,62633,62634) order by master_id')
+
+print(" get adnetwork_id, name from the table 'mp_adpartner'")
+adpartner_dat <- sqlQuery(channel, 'select adnetwork_id, name from mp_adpartner')    # create dataframe from mp_adpartner table
+
+print("accessing mp_tier_exclusion")
+rtb_on_off <- sqlQuery(channel, 'select adspot_id, exclude_rtb, exclude_vm_ads, exclude_mediation from mp_tier_exclusion')
+
+print(" -- Disconnecting Master DB --")
+odbcClose(channel)    #close connection with mysql
+
+print("creating table of mapping zoneid with affiliateid")
+zone_dat <- merge(affiliate_dat, zone_dat, by.x = "affiliateid", by.y = "affiliateid", all.y=TRUE)     # merge ox_zones an ox_affiliate affiliateid wise
+
+print("-- creating table of mapping affiliateid, zoneid with with their adnetwork metavlaues --")
+adspot_wise_metavalue <- merge(zone_dat, metavalue_dat, by.x = "zoneid", by.y = "zone", sort = TRUE)        # create metavalue~adspot mapping table
+
+####################################
+####################################
+
+## read the date-wise data of the date interval considered and combine them into a single dataframe as total_data ##
+print("-- Reading only RTB, Agency and Adnetwork data date-wise and combine them into a single dataframe --")
+
+total_data <- data.frame()
+for(i in 1:date_diff) {
+  file_extension <- gsub("-", "", start_date)
+  path <- paste0("/data/ishita.m/crontab_job/mediation_data_datewise/",start_date,"/mv_vmax_partner_stats_",file_extension,".csv.gz")
+  data <- read.csv(path, sep="|", header=TRUE)
+  data <- data[ , 1:17]
+  colnames(data) <- c("date","account_id","adpartner_id","ad_source_id","country_id","adspot_id","content_id","connection_type","requests_register","requests","ads_received","ads","real_impressions","impressions","clicks","conversions","total_pubrevenue")
+#   data <- data[data$adpartner_id != NO_NETWORK, ] 
+  data$date <- as.Date(format(as.POSIXct(data$date,format='%Y-%m-%d'),format='%Y-%m-%d'),"%Y-%m-%d")
+  total_data <- rbind(data, total_data)
+  start_date <- start_date + 1
+}
+#############################################################################
+##### delete mediation data from current location #####
+print("-- Delete all mediation data from the current path --")
+system("rm -rf mediation_data_datewise", intern = FALSE, ignore.stdout = FALSE, ignore.stderr = FALSE, wait = TRUE, input = NULL)
+#############################################################################
+total_data <- total_data[ ,c("account_id","date","adpartner_id","adspot_id","ad_source_id","requests_register","requests","ads_received","ads","real_impressions","impressions","clicks","conversions","total_pubrevenue")]
+no_network_data <- total_data[total_data$adpartner_id == NO_NETWORK, ]
+total_data <- total_data[total_data$adpartner_id != NO_NETWORK, ]
+
+#### current handling accounts ####
+print("The accounts currently we are handling : [61289,59442,3610,2528,14,60912,55914,61052,11652,60269,16182,62861,61176,60587,6774,803,62713,59444,5102,60088,23494,59877]")
+accounts <- c(14,803,2528,3610,5102,6774,11652,16182,23494,55914,57587,58743,59228,59441,59442,59444,59877,60088,60269,60587,60912,61052,61176,61289,62064,62583,62592,62713,62845,62861)
+
+print("-- Subsetting data for current accounts --")
+no_network_data <- no_network_data[no_network_data$account_id %in% accounts, ]
+total_data <- total_data[total_data$account_id %in% accounts, ]
+
+#  Replace NA values of the numerical columns by zero. e.g. x[c("a", "b")][is.na(x[c("a", "b")])] <- 0
+total_data[c("requests_register","requests","ads_received","ads","real_impressions","impressions","clicks","conversions","total_pubrevenue")][is.na(total_data[c("requests_register","requests","ads_received","ads","real_impressions","impressions","clicks","conversions","total_pubrevenue")])] <- 0
+
+#### no_network_data request summary ####
+no_network_request <- ddply(no_network_data[,c("account_id","date","requests")], .(account_id,date), summarise, total_request = sum(requests))
+ac_imp_cost <- ddply(total_data[,c("account_id","date","impressions","total_pubrevenue")], .(account_id,date), summarise, total_imp = sum(impressions), total_cost = round(sum(total_pubrevenue),2))
+all_ac_summary <- merge(no_network_request, ac_imp_cost, by.x = c("account_id","date"), by.y=c("account_id","date"))
+all_ac_summary$eIPR <- round(all_ac_summary$total_cost*1000/all_ac_summary$total_request,3)
+all_ac_summary$eCPM <- round(all_ac_summary$total_cost*1000/all_ac_summary$total_imp,3)
+all_ac_summary <- all_ac_summary[!is.na(all_ac_summary$date),]
+
+print("Account wise last 7 day cost calculation")
+all_ac_summary_cost <- all_ac_summary[ ,c("account_id","date","total_cost")]
+all_ac_cost <- cast(all_ac_summary_cost, account_id~date, value="total_cost")
+all_ac_cost <- merge(affiliate_dat, all_ac_cost, by.x="ac_id", by.y="account_id")
+
+### sort cost dataframe by the last day in decreasing order ###
+all_ac_cost <-  all_ac_cost[order(all_ac_cost[,ncol(all_ac_cost)], decreasing=TRUE, na.last=TRUE), ]
+cost_acounts <- all_ac_cost$ac_id
+
+print("Account wise last 7 day eIPR calculation")
+all_ac_summary_eIPR <- all_ac_summary[ ,c("account_id","date","eIPR")]
+all_ac_eIPR <- cast(all_ac_summary_eIPR, account_id~date, value="eIPR")
+all_ac_eIPR <- merge(affiliate_dat, all_ac_eIPR, by.x="ac_id", by.y="account_id")
+
+### Sort eIPR dataframe rows according to a target vector i.e. Cost dataframe ac_id that specifies the desired order ###
+all_ac_eIPR <- all_ac_eIPR[match(cost_acounts, all_ac_eIPR$ac_id),]
+
+print("Account wise last 7 day Request calculation")
+all_ac_summary_request <- all_ac_summary[ ,c("account_id","date","total_request")]
+all_ac_request <- cast(all_ac_summary_request, account_id~date, value="total_request")
+all_ac_request <- merge(affiliate_dat, all_ac_request, by.x="ac_id", by.y="account_id")
+
+### Sort Request dataframe rows according to a target vector i.e. Cost dataframe ac_id that specifies the desired order ###
+all_ac_request <- all_ac_request[match(cost_acounts, all_ac_request$ac_id),]
+
+# print("Account wise last 7 day eCPM calculation")
+# all_ac_summary_eCPM <- all_ac_summary[ ,c("account_id","date","eCPM")]
+# all_ac_eCPM <- cast(all_ac_summary_eCPM, account_id~date, value="eCPM")
+# all_ac_eCPM <- merge(affiliate_dat, all_ac_eCPM, by.x="ac_id", by.y="account_id")
+
+### unique_adspots for RTB_Agency_Adnetwork_status report ###
+total_data_adspots <- unique(total_data$adspot_id)
+
+# #### segment-wise aggregated data of all accounts of each date considered ###
+print("Segments considered for calculation: account_id, date, adpartner_id, adspot_id, ad_source_id")
+print("-- aggregation of raw data segment-wise --")
+# all_adpartner_data <- aggregate(total_data[, c("requests_register","requests","ads_received","ads","real_impressions","impressions","clicks","conversions","total_pubrevenue")], by=list(ac_id=total_data$account_id, date=total_data$date, ad_partner_id=total_data$adpartner_id, adspot_id=total_data$adspot_id, adsource_id=total_data$ad_source_id),FUN=sum, na.rm=TRUE)
+all_adpartner_data <- aggregate(total_data[, c("requests_register","requests","ads_received","ads","real_impressions","impressions","clicks","conversions","total_pubrevenue")], by=list(ac_id=total_data$account_id, date=total_data$date, ad_partner_id=total_data$adpartner_id, adspot_id=total_data$adspot_id, adsource_id=total_data$ad_source_id),FUN=sum)
+#############################################################################
+
+#### SUMMARY CALCULATION ####
+adpartner_data_for_summary <- all_adpartner_data
+adpartner_data_for_summary$adpartner_flag <- ifelse(adpartner_data_for_summary$ad_partner_id %in% ag_rtb_dd_rem, adpartner_data_for_summary$ad_partner_id, adpartner_data_for_summary$adsource_id)
+adpartner_data_for_summary <- merge(adpartner_data_for_summary, adpartner_dat, by.x = "ad_partner_id", by.y = "adnetwork_id", all.x=TRUE)
+adpartner_data_for_summary <- adpartner_data_for_summary[adpartner_data_for_summary$adpartner_flag != 0, c("ac_id","adspot_id","adpartner_flag","name","date","requests_register","requests","ads","impressions","clicks","conversions","total_pubrevenue")]
+source_name_table <- unique(adpartner_data_for_summary[ , c("adpartner_flag", "name")])
+colnames(source_name_table) <- c("adpartner_flag", "adpartner_name")
+# zoneid_list_for_summary <-unique(adpartner_data_for_summary$adspot_id[adpartner_data_for_summary$adspot_id!=0])
+partner_stats <- ddply(adpartner_data_for_summary[ ,c("adspot_id","adpartner_flag","date","requests","requests_register","ads","impressions","clicks","conversions","total_pubrevenue")], .(adspot_id,adpartner_flag,date),summarise, req_sent = sum(requests), req_reg =sum(requests_register), ads =sum(ads), imps = sum(impressions), clicks = sum(clicks), convs = sum(conversions), revenue = round(sum(total_pubrevenue),3), eCPM = round(revenue*1000/imps,3))
+ad_partner_summary <- merge(partner_stats, source_name_table, by.x = "adpartner_flag", by.y = "adpartner_flag", all.x = TRUE)
+ad_partner_summary <- merge(zone_dat, ad_partner_summary, by.x = "zoneid", by.y = "adspot_id")
+ad_partner_summary_final <- ad_partner_summary[ , c("ac_name","ac_id","affiliateid","zone_type","zoneid","zonename","zonekey","zone_label","adpartner_name","date","req_sent","req_reg","ads","imps","clicks","convs","revenue","eCPM")]
+# class(ad_partner_summary_final$revenue) <- "dollar"
+# class(ad_partner_summary_final$eCPM) <- "dollar""
+ad_partner_summary_final <- arrange(ad_partner_summary_final, ac_id, zoneid, adpartner_name, date)
+# colnames(df)[which(colnames(df) == 'old_colname')] <- 'new_colname'
+colnames(ad_partner_summary_final)[which(colnames(ad_partner_summary_final) == 'req_reg')] <- 'attempts'
+#######################################################
+
+### THRESHOLD CALCULATION ###
+zoneid_list <- intersect(unique(all_adpartner_data$adspot_id[all_adpartner_data$adspot_id!=0]),adspot_wise_metavalue$zoneid)
+adpartner_data_for_threshold <- all_adpartner_data[all_adpartner_data$adspot_id %in% zoneid_list, ]
+adpartner_data_for_threshold$adpartner_flag <- ifelse(adpartner_data_for_threshold$ad_partner_id == AGENCY_ID | adpartner_data_for_threshold$ad_partner_id == RTB_ID, adpartner_data_for_threshold$ad_partner_id, ADN_ID)
+adpartner_data_for_threshold$network_flag <- ifelse(adpartner_data_for_threshold$ad_partner_id == AGENCY_ID | adpartner_data_for_threshold$ad_partner_id == RTB_ID, adpartner_data_for_threshold$ad_partner_id, adpartner_data_for_threshold$adsource_id)
+adpartner_data_for_threshold <- adpartner_data_for_threshold[adpartner_data_for_threshold$network_flag != 0, c("ac_id","adspot_id","adpartner_flag","network_flag","date","requests_register","requests","ads","impressions","clicks","conversions","total_pubrevenue")]
+
+all_adpartner_data_th <- adpartner_data_for_threshold[order(adpartner_data_for_threshold$adspot_id, adpartner_data_for_threshold$adpartner_flag, adpartner_data_for_threshold$date), c("ac_id","adspot_id","adpartner_flag","date","requests_register","requests","ads","impressions","clicks","conversions","total_pubrevenue")]
+all_adpartner_data_th_1 <- aggregate(all_adpartner_data_th[ ,c("requests","requests_register","ads","impressions","clicks","conversions","total_pubrevenue")], by=list(ac_id=all_adpartner_data_th$ac_id, adspot_id=all_adpartner_data_th$adspot_id, adpartner_flag=all_adpartner_data_th$adpartner_flag, date=all_adpartner_data_th$date),FUN=sum)
+all_adpartner_data_th_2 <- ddply(all_adpartner_data_th_1, c("adspot_id","adpartner_flag"), function(x) head(x[order(x$date,  decreasing = TRUE) , ], 7))
+
+threshold_stats <- ddply(all_adpartner_data_th_2[ ,c("adspot_id","adpartner_flag","requests_register","requests","ads","impressions","clicks","conversions","total_pubrevenue")], .(adspot_id, adpartner_flag),summarise, req_sent = sum(requests), req_reg =sum(requests_register), ads=sum(ads), imps = sum(impressions), clicks = sum(clicks), convs = sum(conversions), revenue = sum(total_pubrevenue), ctr = clicks/imps, eCPM = revenue*1000/imps, eCPC = revenue/clicks)
+
+cast_melt_data <- cast(melt(threshold_stats[ ,c("adspot_id","adpartner_flag","req_sent","ads","imps","clicks","revenue","eCPM","eCPC")], id = c("adspot_id","adpartner_flag")), adspot_id+adpartner_flag~variable, sum)
+agency_data <- cast_melt_data[cast_melt_data$adpartner_flag == AGENCY_ID, c("adspot_id","req_sent","ads","imps","clicks","revenue","eCPC")]; names(agency_data) = c("adspot_id","agency_req","agency_ads","agency_imps","agency_clicks","agency_revenue","agency_eCPC")    
+rtb_data <- cast_melt_data[cast_melt_data$adpartner_flag == RTB_ID, c("adspot_id","req_sent","ads","imps","clicks","revenue","eCPM")]; names(rtb_data) = c("adspot_id","rtb_req","rtb_ads","rtb_imps","rtb_clicks","rtb_revenue","rtb_eCPM")
+adn_data <- cast_melt_data[cast_melt_data$adpartner_flag == ADN_ID, c("adspot_id","req_sent","ads","imps","clicks","revenue","eCPM","eCPC")]; names(adn_data) = c("adspot_id","adn_req","adn_ads","adn_imps","adn_clicks","adn_revenue","adn_eCPM","adn_eCPC")
+ad_partner_stats <- Reduce(function(x,y) merge(x,y, all=TRUE), list(agency_data,rtb_data,adn_data))
+
+no_adn_data_adspots <- unique(ad_partner_stats$adspot_id[is.na(ad_partner_stats$adn_eCPM) | is.infinite(ad_partner_stats$adn_eCPM) | ad_partner_stats$adn_eCPM == 0])
+ad_partner_stats <- ad_partner_stats[!(ad_partner_stats$adspot_id %in% no_adn_data_adspots), ]
+# ad_partner_stats$rtb_ecpm_alarm <- ifelse(is.na(ad_partner_stats$rtb_eCPM) | (ad_partner_stats$rtb_eCPM < ad_partner_stats$adn_eCPM), "ALARM!!!", "cool")
+# ad_partner_stats$agency_ecpc_alarm <- ifelse(is.na(ad_partner_stats$agency_eCPC) | is.infinite(ad_partner_stats$agency_eCPC) | (ad_partner_stats$agency_eCPC < ad_partner_stats$adn_eCPC), "ALARM!!!", "cool")
+
+## new logic
+ad_partner_stats$rtb_ecpm_alarm <- ifelse(is.na(ad_partner_stats$rtb_eCPM) | (((ad_partner_stats$adn_eCPM-ad_partner_stats$rtb_eCPM)/ad_partner_stats$adn_eCPM) > RTB_TH_DEV), "ALARM!!!", "cool")
+ad_partner_stats$agency_ecpc_alarm <- ifelse(is.na(ad_partner_stats$agency_eCPC) | is.infinite(ad_partner_stats$agency_eCPC) | (((ad_partner_stats$adn_eCPC-ad_partner_stats$agency_eCPC)/ad_partner_stats$adn_eCPC) > AGENCY_TH_DEV), "ALARM!!!", "cool")
+###
+ad_partner_stats$new_rtb_ecpm_th <- ifelse(ad_partner_stats$rtb_ecpm_alarm == "ALARM!!!", round(ad_partner_stats$adn_eCPM, 3), "no_change")
+ad_partner_stats$new_agency_ecpc_th <- ifelse(ad_partner_stats$agency_ecpc_alarm == "ALARM!!!", ifelse(is.infinite(ad_partner_stats$adn_eCPC), DEFAULT_ECPC, round(ad_partner_stats$adn_eCPC, 3)), "no_change")
+ad_partner_stats$new_agency_ecpc_th[ad_partner_stats$new_agency_ecpc_th == 0] <- 0.01
+automode_rtb <- c(164694,168365,168041)
+automode_agency <- c(164694,165774,151939,169207,164387,164388,164873,164872,166927,166955,169497,169498,169500,169501,166229,167054,167055,167056,167057,167059,167060,167061,167062,167063,167065,167066,167067,167069)
+
+ad_partner_stats$new_rtb_ecpm_th[ad_partner_stats$adspot_id %in% automode_rtb] <- "rtb_automode"
+ad_partner_stats$new_agency_ecpc_th[ad_partner_stats$adspot_id %in% automode_agency] <- "agency_automode"
+
+threshold_table <- merge(zone_dat, ad_partner_stats, by.x = "zoneid", by.y = "adspot_id")
+threshold_table_1 <- threshold_table[threshold_table$adn_imps > 500, ]
+cool_adspots <- threshold_table_1$zoneid[(threshold_table_1$new_rtb_ecpm_th == "no_change" & threshold_table_1$new_agency_ecpc_th == "no_change") | (threshold_table_1$new_rtb_ecpm_th == "rtb_automode" & threshold_table_1$new_agency_ecpc_th == "agency_automode") | (threshold_table_1$new_rtb_ecpm_th == "no_change" & threshold_table_1$new_agency_ecpc_th == "agency_automode") | (threshold_table_1$new_rtb_ecpm_th == "rtb_automode" & threshold_table_1$new_agency_ecpc_th == "no_change")]
+
+
+threshold_table_1 <- threshold_table_1[! (threshold_table_1$zoneid %in% cool_adspots), ]
+# names(threshold_table) <- c("zoneid","affiliateid","zone_name","zonekey","ac_name","ac_id","agency_req","agency_ads","agency_imps","agency_clicks","agency_revenue","agency_eCPC","rtb_req","rtb_ads","rtb_imps","rtb_clicks","rtb_revenue","rtb_eCPM","adn_req","adn_ads","adn_imps","adn_clicks","adn_revenue","adn_eCPM","adn_eCPC","rtb_ecpm_alarm","new_rtb_ecpm_th","agency_ecpc_alarm","new_agency_ecpc_th")
+# threshold_table_final <- threshold_table[ ,c("ac_name","ac_id","affiliateid","zone_type","zoneid","zone_name","zonekey","agency_req","agency_ads","agency_imps","agency_clicks","agency_revenue","agency_eCPC","rtb_req","rtb_ads","rtb_imps","rtb_clicks","rtb_revenue","rtb_eCPM","adn_req","adn_ads","adn_imps","adn_clicks","adn_revenue","adn_eCPM","adn_eCPC","rtb_ecpm_alarm","new_rtb_ecpm_th","agency_ecpc_alarm","new_agency_ecpc_th")]
+threshold_table_final <- threshold_table_1[ ,c("ac_name","ac_id","affiliateid","zone_type","zoneid","zonename","zonekey","zone_label","new_rtb_ecpm_th","new_agency_ecpc_th")]
+threshold_table_final <- arrange(threshold_table_final, ac_id, zoneid)
+class(threshold_table_final$new_rtb_ecpm_th[threshold_table_final$new_rtb_ecpm_th != "no_change"]) <- "dollar"
+class(threshold_table_final$new_agency_ecpc_th) <- "dollar"
+##############################################
+
+######### WEIGHT ALARM SECTION #############
+ad_network_data_weight_alarm <- adpartner_data_for_threshold[adpartner_data_for_threshold$adpartner_flag == ADN_ID , c("ac_id","adspot_id","network_flag","date","requests_register","requests","ads","impressions","clicks","conversions","total_pubrevenue")]
+adn_count <- aggregate(network_flag ~ adspot_id, data=ad_network_data_weight_alarm, FUN=function(x) length(unique(x)))
+adspot_list_for_weights <- adn_count$adspot_id[adn_count$network_flag > 1] ; ad_network_data_weight <- ad_network_data_weight_alarm[ad_network_data_weight_alarm$adspot_id %in% adspot_list_for_weights, c("adspot_id","network_flag","date","requests","total_pubrevenue")]
+ad_network_data_weight <- ddply(ad_network_data_weight, c("adspot_id","network_flag"), function(x) head(x[order(x$date,  decreasing = TRUE) , ], 8))
+
+ad_network_data_weight_test <- ddply(ad_network_data_weight, c("adspot_id","network_flag"), function(x) head(x[order(x$date, decreasing = TRUE) , ], 1)) ; test_zones <- unique(ad_network_data_weight_test$adspot_id)
+ad_network_data_weight_training <- anti_join(ad_network_data_weight, ad_network_data_weight_test) ; training_zones <- unique(ad_network_data_weight_training$adspot_id)
+diff_zones <- setdiff(test_zones, training_zones) ; ad_network_data_weight_test <- ad_network_data_weight_test[!(ad_network_data_weight_test$adspot_id %in% diff_zones), ]
+
+training_data_erpm <- ddply(ad_network_data_weight_training, .(adspot_id, network_flag), summarise, req_sent_training = sum(requests), revenue_training = sum(total_pubrevenue), eRPM_training = revenue_training*1000/req_sent_training)
+test_data_erpm <- ddply(ad_network_data_weight_test, .(adspot_id, network_flag), summarise, req_sent_test = sum(requests), revenue_test = sum(total_pubrevenue), eRPM_test  = revenue_test *1000/req_sent_test)
+
+erpm_training_test <- merge(training_data_erpm[ ,c("adspot_id","network_flag","eRPM_training")], test_data_erpm[ ,c("adspot_id","network_flag","eRPM_test")], by.x = c("adspot_id","network_flag"), by.y = c("adspot_id","network_flag"))
+
+erpm_training_test_weight <- ddply(erpm_training_test, .(adspot_id), transform, eRPM_training_weight=round(eRPM_training/sum(eRPM_training),3), eRPM_test_weight=round(eRPM_test/sum(eRPM_test),3))
+erpm_training_test_weight$weight_dev <- round(abs(erpm_training_test_weight$eRPM_training_weight - erpm_training_test_weight$eRPM_test_weight),3)
+#########
+weight_alarm <-  ddply(erpm_training_test_weight, .(adspot_id), summarise, weight_alarm = ifelse(1 %in% (ifelse(weight_dev > WT_DEV_ALLWNC, 1, 0)), "alarm!!!", "no_change"))
+weight_alarm_table <- merge(zone_dat, weight_alarm, by.x = "zoneid", by.y = "adspot_id")
+weight_alarm_table_1 <- weight_alarm_table[ , c("ac_name","ac_id","affiliateid","zone_type","zoneid","zonename","zonekey","zone_label","weight_alarm")]
+weight_alarm_table_1 <- arrange(weight_alarm_table_1, ac_id, zoneid)
+weight_alarm_table_final <- weight_alarm_table_1[weight_alarm_table_1$weight_alarm != "no_change", ]
+##############################################################
+
+### RTB/Agency/Mediation Status ###
+rtb_on_off <- rtb_on_off[rtb_on_off$adspot_id %in% total_data_adspots, ]
+rtb_on_off$RTB_status <- ifelse(rtb_on_off$exclude_rtb == 1, "off", "on")
+rtb_on_off$Agency_status <- ifelse(rtb_on_off$exclude_vm_ads == 1, "off", "on")
+rtb_on_off$Adnetwork_status <- ifelse(rtb_on_off$exclude_mediation > 0, ifelse(rtb_on_off$exclude_mediation == 1, "off", "auto"), "manual")
+rtb_on_off <- rtb_on_off[, c("adspot_id","RTB_status","Agency_status","Adnetwork_status")]
+rtb_on_off <- merge(zone_dat, rtb_on_off, by.x = "zoneid", by.y = "adspot_id")
+rtb_on_off <- rtb_on_off[, c("ac_name","ac_id","affiliateid","zone_type","zoneid","zonename","zonekey","zone_label","RTB_status","Agency_status","Adnetwork_status")]
+#############################################################
+
+### Excel file 1 : two sheets (1.ac wise summary, 2.adspot wise summary) ###
+### 1. ac wise summary ###
+# list_of_df <- list(all_ac_cost,all_ac_eIPR,all_ac_eCPM)
+list_of_df <- list(all_ac_cost,all_ac_eIPR,all_ac_request)
+### create blank workbook ###
+publisher_summary_report <- createWorkbook()
+
+### ad 1st sheet of ac wise summary ###
+ac_wise_summary = createSheet(publisher_summary_report, sheetName = "AC_wise_Summary")
+
+## Cost Title define and formatting ###
+cost_title <- CellStyle(publisher_summary_report) + Font(publisher_summary_report, heightInPoints=14, isBold=TRUE)
+rows_cost <- createRow(ac_wise_summary,rowIndex=1)
+sheetTitle_cost <- createCell(rows_cost, colIndex=1)
+setCellValue(sheetTitle_cost[[1,1]], "Account wise Daily Cost ($)")
+setCellStyle(sheetTitle_cost[[1,1]], cost_title)
+
+cs_format <- CellStyle(publisher_summary_report) +  Font(publisher_summary_report, heightInPoints=10, name="Calibri") + Alignment(horizontal = "ALIGN_CENTER",vertical = "VERTICAL_CENTER")+ Border(position=c("TOP","BOTTOM","LEFT","RIGHT"),color = "black") 
+headerStyle_ac_summary <- CellStyle(publisher_summary_report)+ Font(publisher_summary_report, isBold=TRUE, name="Calibri")+Fill(foregroundColor = "lightblue",pattern = "SOLID_FOREGROUND")+Alignment(horizontal = "ALIGN_CENTER",vertical = "VERTICAL_CENTER") + Border(pen = "BORDER_MEDIUM", position=c("TOP","BOTTOM","LEFT","RIGHT"), color = "black")
+
+cell_format_cost <- rep(list(cs_format), (dim(all_ac_cost)[2])) # style for remaining columns
+names(cell_format_cost) <- seq(1, dim(all_ac_cost)[2], by = 1) # assign names to list elements
+cell_format_eIPR <- rep(list(cs_format), (dim(all_ac_eIPR)[2])) # style for remaining columns
+names(cell_format_eIPR) <- seq(1, dim(all_ac_eIPR)[2], by = 1) # assign names to list elements
+cell_format_Request <- rep(list(cs_format), (dim(all_ac_request)[2])) # style for remaining columns
+names(cell_format_Request) <- seq(1, dim(all_ac_request)[2], by = 1) # assign names to list elements
+# cell_format_eCPM <- rep(list(cs_format), (dim(all_ac_eCPM)[2])) # style for remaining columns
+# names(cell_format_eCPM) <- seq(1, dim(all_ac_eCPM)[2], by = 1) # assign names to list elements
+
+### ad cost dataframe ###
+addDataFrame(list_of_df[[1]], sheet = ac_wise_summary, row.names=FALSE, startRow=2, colnamesStyle = headerStyle_ac_summary, colStyle = cell_format_cost)
+
+startRow <- nrow(list_of_df[[1]]) + 4
+
+### eIPR title define and formatting ###
+eIPR_title <- CellStyle(publisher_summary_report) + Font(publisher_summary_report, heightInPoints=14, isBold=TRUE)
+rows_eIPR <- createRow(ac_wise_summary,rowIndex=startRow)
+sheetTitle_eIPR <- createCell(rows_eIPR, colIndex=1)
+setCellValue(sheetTitle_eIPR[[1,1]], "Account wise Daily eIPR ($)")
+setCellStyle(sheetTitle_eIPR[[1,1]], eIPR_title)
+
+## ad eIPR dataframe ##
+addDataFrame(list_of_df[[2]], sheet = ac_wise_summary, row.names=FALSE, startRow = startRow+1, colnamesStyle = headerStyle_ac_summary, colStyle = cell_format_eIPR)
+
+startRow <- startRow + nrow(list_of_df[[2]]) + 3
+
+### Request title define and formatting ###
+Request_title <- CellStyle(publisher_summary_report) + Font(publisher_summary_report, heightInPoints=14, isBold=TRUE)
+rows_Request <- createRow(ac_wise_summary, rowIndex = startRow)
+sheetTitle_Request <- createCell(rows_Request, colIndex = 1)
+setCellValue(sheetTitle_Request[[1,1]], "Account wise Daily Request")
+setCellStyle(sheetTitle_Request[[1,1]], Request_title)
+
+## ad Request dataframe ##
+addDataFrame(list_of_df[[3]], sheet = ac_wise_summary, row.names=FALSE, startRow = startRow+1, colnamesStyle = headerStyle_ac_summary, colStyle = cell_format_Request)
+
+# ### eCPM title define and formatting ###
+# eCPM_title <- CellStyle(publisher_summary_report) + Font(publisher_summary_report, heightInPoints=14, isBold=TRUE)
+# rows_eCPM <- createRow(ac_wise_summary,rowIndex=startRow)
+# sheetTitle_eCPM <- createCell(rows_eCPM, colIndex=1)
+# setCellValue(sheetTitle_eCPM[[1,1]], "Account wise Daily eCPM ($)")
+# setCellStyle(sheetTitle_eCPM[[1,1]], eCPM_title)
+# 
+# ## ad eCPM dataframe ##
+# addDataFrame(list_of_df[[3]], sheet = ac_wise_summary, row.names=FALSE, startRow = startRow+1, colnamesStyle = headerStyle_ac_summary, colStyle = cell_format_eCPM)
+
+### 2. adspot wise summary ###
+summary_sheet_name <- paste("Detail_Stats_",start_month,start_day,"_to_",end_month,end_day,sep="")
+adspot_wise_summary <- createSheet(publisher_summary_report, sheetName=summary_sheet_name)
+headerStyle <- CellStyle(publisher_summary_report)+ Font(publisher_summary_report, isBold=TRUE, color ="9", name="Arial")+Fill(foregroundColor = "#0069AA",pattern = "SOLID_FOREGROUND")+Alignment(horizontal = "ALIGN_CENTER",vertical = "VERTICAL_CENTER") + Border(pen = "BORDER_MEDIUM", position=c("TOP","BOTTOM","LEFT","RIGHT"), color = "black")
+addDataFrame(x = ad_partner_summary_final, sheet = adspot_wise_summary, row.names = F, colnamesStyle = headerStyle)
+autoSizeColumn(adspot_wise_summary, colIndex=c(1:ncol(ad_partner_summary_final)))
+
+xlFileName_summary <- paste("Publisher_Summary_Report_",currentDate,".xlsx",sep="")
+saveWorkbook(publisher_summary_report, xlFileName_summary)
+
+#########################################################################################################
+#### Excel file 2 : three sheets (1.Adpartner_Status, 2.RTB_Agency_Thresholds, 3.weight change alarm) ###
+
+publisher_analysis_report <- createWorkbook()
+
+adpartner_status <- createSheet(publisher_analysis_report, sheetName="Adpartner_Status")
+threshold <- createSheet(publisher_analysis_report, sheetName="RTB_Agency_Threshold")
+weight_alarm <- createSheet(publisher_analysis_report, sheetName="Weight_Alarm")
+
+cs_format2 <- CellStyle(publisher_analysis_report) +  Font(publisher_analysis_report, heightInPoints=10, name="Calibri") + Alignment(horizontal = "ALIGN_CENTER",vertical = "VERTICAL_CENTER")+ Border(position=c("TOP","BOTTOM","LEFT","RIGHT"),color = "black") 
+headerStyle_analysis <- CellStyle(publisher_analysis_report)+ Font(publisher_analysis_report, isBold=TRUE, color ="9", name="Arial")+Fill(foregroundColor = "#0069AA",pattern = "SOLID_FOREGROUND")+Alignment(horizontal = "ALIGN_CENTER",vertical = "VERTICAL_CENTER") + Border(pen = "BORDER_MEDIUM", position=c("TOP","BOTTOM","LEFT","RIGHT"), color = "black")
+
+cell_format_status <- rep(list(cs_format2), (dim(rtb_on_off)[2])) # style for remaining columns
+names(cell_format_status) <- seq(1, dim(rtb_on_off)[2], by = 1) # assign names to list elements
+
+cell_format_th <- rep(list(cs_format2), (dim(threshold_table_final)[2])) # style for remaining columns
+names(cell_format_th) <- seq(1, dim(threshold_table_final)[2], by = 1) # assign names to list elements
+
+cell_format_wt <- rep(list(cs_format2), (dim(weight_alarm_table_final)[2])) # style for remaining columns
+names(cell_format_wt) <- seq(1, dim(weight_alarm_table_final)[2], by = 1) # assign names to list elements
+
+addDataFrame(x = rtb_on_off, sheet = adpartner_status, row.names = F, colnamesStyle = headerStyle_analysis, colStyle = cell_format_status)
+addDataFrame(x = threshold_table_final, sheet = threshold, row.names = F, colnamesStyle = headerStyle_analysis, colStyle = cell_format_th)
+addDataFrame(x = weight_alarm_table_final, sheet = weight_alarm, row.names = F, colnamesStyle = headerStyle_analysis, colStyle = cell_format_wt)
+
+autoSizeColumn(adpartner_status, colIndex=c(1:ncol(rtb_on_off)))
+autoSizeColumn(threshold, colIndex=c(1:ncol(threshold_table_final)))
+autoSizeColumn(weight_alarm, colIndex=c(1:ncol(weight_alarm_table_final)))
+
+xlFileName_analysis <- paste("Adpartner_Status_Thresholds_",currentDate,".xlsx",sep="")
+saveWorkbook(publisher_analysis_report, xlFileName_analysis)
+
+##############################################################
+program.end.time <- Sys.time()
+paste0("End Time of the code: ",program.end.time)
+total.time.taken <- program.end.time - program.start.time
+# paste0("Total time taken to rum from Start to End: ",total.time.taken)
+paste0("Total time taken to rum from Start to End: ")
+print(total.time.taken)
+##############################################################
+
+### EMAIL PART ###
+  print("Send the report to shrinivas.v@vserv.com, ashish.v@vserv.com, ishita.m@vserv.com")
+  email_subject <- paste0("Publisher Account Report as on ",noquote(currentDate)) ; email_subject <- paste0("\"",email_subject,"\"",sep="")
+  attachment_1_path <- paste0("/data/ishita.m/crontab_job/",xlFileName_summary) ; attachment_1_path <- paste("\"",attachment_1_path,"\"",sep="")
+  attachment_2_path <- paste0("/data/ishita.m/crontab_job/",xlFileName_analysis) ; attachment_2_path <- paste("\"",attachment_2_path,"\"",sep="")
+
+# attachment_path <- paste0("/data/ishita.m/crontab_job/",xlFileName) ; attachment_path <- paste("\"",attachment_path,"\"",sep="")
+  # to_recipient <- noquote(paste0("-- alok.k@vmax.com"))
+  to_recipient <- noquote(paste0("-- ishita.m@vserv.com"))
+  # cc_recipients <- noquote(paste0("-c somnath@vmax.com -c ashish.v@vserv.com -c shrinivas.v@vserv.com -c ishita.m@vserv.com"))
+  cc_recipients <- noquote(paste0("-c ishita.m@vserv.com"))
+  # to_recipient <- noquote(paste0("-- productsupport@vmax.com"))
+  # cc_recipients <- noquote(paste0("-c ashay@vserv.com -c ashish.v@vserv.com -c shrinivas.v@vserv.com -c ishita.m@vserv.com"))
+  
+  ### SHELL COMMAND for email sending with attachment ##
+  print("SHELL COMMAND for email sending with attachment:")
+  email_sending_syntax <- paste("mutt -a",attachment_1_path,"-a",attachment_2_path,"-s", email_subject, cc_recipients, to_recipient, "< sum_th_body_new.txt", sep=" ")
+
+# email_sending_syntax <- paste("mutt -a",attachment_path,"-s", email_subject, cc_recipients, to_recipient, "< sum_th_body_new.txt", sep=" ")
+  
+  #### R Command to execute from SHELL ####
+  system(paste0(email_sending_syntax),intern = FALSE, ignore.stdout = FALSE, ignore.stderr = FALSE, wait = TRUE, input = NULL)
+
+# print(" -- END OF R-code of automation --")
+#######################################################
